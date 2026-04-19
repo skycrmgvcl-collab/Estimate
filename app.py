@@ -4,90 +4,111 @@ import pdfplumber
 import re
 import io
 
-st.set_page_config(page_title="DISCOM Estimator", layout="wide")
+st.set_page_config(page_title="DISCOM Estimate Builder", layout="wide")
 
 def clean_rate(rate_str):
+    """Cleans currency strings like '314,561' into numbers."""
     if not rate_str: return 0.0
-    # Removes commas and non-numeric characters
-    return float(re.sub(r'[^\d.]', '', str(rate_str)))
+    cleaned = re.sub(r'[^\d.]', '', str(rate_str))
+    return float(cleaned) if cleaned else 0.0
 
-def process_uploaded_files(files):
+def process_pdfs(files):
+    """Extracts cost data from multiple uploaded PDFs."""
     all_rows = []
     for uploaded_file in files:
-        # Open PDF from memory
         with pdfplumber.open(io.BytesIO(uploaded_file.read())) as pdf:
             for page in pdf.pages:
                 table = page.extract_table()
                 if table:
-                    # Creating DF - assuming first row is headers
+                    # Creating DF - treating first row as headers
                     df = pd.DataFrame(table[1:], columns=table[0])
                     for _, row in df.iterrows():
-                        # Use .get() to avoid errors if column names vary slightly
-                        particulars = str(row.get('PARTICULARS', '')).replace('\n', ' ')
-                        rate = clean_rate(row.get('RATE\n Rs.', 0))
-                        if particulars and rate > 0:
+                        # Cleaning columns based on your specific PDF headers
+                        particulars = str(row.get('PARTICULARS\n', row.get('PARTICULARS', ''))).replace('\n', ' ')
+                        rate_val = row.get('RATE\n Rs.\n', row.get('RATE\n Rs.', 0))
+                        rate = clean_rate(rate_val)
+                        
+                        if particulars.strip() and rate > 0:
                             all_rows.append({
-                                "Group_Code": str(row.get('Group Code', '')).strip(),
-                                "Particulars": particulars,
-                                "Unit": row.get('UNIT', ''),
+                                "Group_Code": str(row.get('Group Code\n', row.get('Group Code', ''))).strip(),
+                                "Particulars": particulars.strip(),
+                                "Unit": str(row.get('UNIT\n', row.get('UNIT', ''))).strip(),
                                 "Rate": rate
                             })
     return pd.DataFrame(all_rows)
 
 st.title("⚡ DISCOM Work Expenditure Estimator")
+st.caption("Automated Estimation Tool for Sub-division Work")
 
-# --- STEP 1: UPLOAD ---
-st.sidebar.header("Data Sources")
-uploaded_pdfs = st.sidebar.file_uploader(
-    "Upload Cost Data PDFs", 
-    type="pdf", 
-    accept_multiple_files=True
-)
+# --- SIDEBAR: FILE UPLOAD ---
+st.sidebar.header("Configuration")
+uploaded_pdfs = st.sidebar.file_uploader("Upload Cost Data PDFs", type="pdf", accept_multiple_files=True)
 
 if not uploaded_pdfs:
-    st.info("Please upload one or more Cost Data PDFs in the sidebar to begin.")
+    st.info("👈 Please upload your Cost Data PDFs in the sidebar to start.")
     st.stop()
 
-# Process data
-master_df = process_uploaded_files(uploaded_pdfs)
+# Load and process data once
+master_df = process_pdfs(uploaded_pdfs)
 
-# --- STEP 2: ESTIMATE LOGIC ---
-if 'estimate_basket' not in st.session_state:
-    st.session_state.estimate_basket = []
+# --- ESTIMATE LOGIC ---
+if 'basket' not in st.session_state:
+    st.session_state.basket = []
 
 with st.container():
     st.subheader("Add Work Items")
-    search = st.text_input("Search Particulars (e.g. 'Transformer', '11KV')")
+    search = st.text_input("Search (e.g., '11 KV', 'Transformer', 'Service')")
     
-    filtered_df = master_df[master_df['Particulars'].str.contains(search, case=False, na=False)]
+    # Filtering the master data based on search
+    filtered = master_df[master_df['Particulars'].str.contains(search, case=False, na=False)]
     
-    if not filtered_df.empty:
-        selection = st.selectbox("Select Item", filtered_df['Particulars'].unique())
-        item_row = master_df[master_df['Particulars'] == selection].iloc[0]
+    if not filtered.empty:
+        selection = st.selectbox("Select exact item from list:", filtered['Particulars'].unique())
+        item = master_df[master_df['Particulars'] == selection].iloc[0]
         
-        c1, c2 = st.columns(2)
-        qty = c1.number_input(f"Quantity ({item_row['Unit']})", min_value=0.0, step=1.0)
+        c1, c2 = st.columns([2, 1])
+        qty = c1.number_input(f"Enter Quantity ({item['Unit']})", min_value=0.0, step=0.01, format="%.2f")
         
-        if c2.button("Add to Estimate", use_container_width=True):
-            st.session_state.estimate_basket.append({
-                "Group Code": item_row['Group_Code'],
-                "Description": item_row['Particulars'],
-                "Unit": item_row['Unit'],
-                "Rate": item_row['Rate'],
+        if c2.button("➕ Add to Estimate", use_container_width=True):
+            st.session_state.basket.append({
+                "Group Code": item['Group_Code'],
+                "Particulars": item['Particulars'],
+                "Unit": item['Unit'],
+                "Rate": item['Rate'],
                 "Qty": qty,
-                "Total": qty * item_row['Rate']
+                "Total": qty * item['Rate']
             })
+            st.success("Item added!")
             st.rerun()
+    else:
+        st.warning("No items found matching your search.")
 
-# --- STEP 3: DISPLAY & EXPORT ---
-if st.session_state.estimate_basket:
+# --- DISPLAY TABLE & EXPORT ---
+if st.session_state.basket:
     st.divider()
-    final_df = pd.DataFrame(st.session_state.estimate_basket)
-    st.dataframe(final_df, use_container_width=True)
+    st.subheader("Current Estimate Breakdown")
+    est_df = pd.DataFrame(st.session_state.basket)
     
-    total = final_df['Total'].sum()
-    st.metric("Grand Total Expenditure", f"Rs. {total:,.2f}")
+    # Display table with formatted currency
+    st.table(est_df.style.format({"Rate": "{:,.2f}", "Total": "{:,.2f}"}))
     
-    if st.button("Clear All"):
-        st.session_state.estimate_basket = []
+    grand_total = est_df['Total'].sum()
+    st.metric("Total Estimated Expenditure", f"Rs. {grand_total:,.2f}")
+    
+    col_ex, col_cl = st.columns([1, 4])
+    
+    # Excel Export
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        est_df.to_excel(writer, index=False, sheet_name='WorkEstimate')
+    
+    col_ex.download_button(
+        label="📥 Download Excel",
+        data=output.getvalue(),
+        file_name="discom_estimate.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    
+    if col_cl.button("🗑️ Clear All"):
+        st.session_state.basket = []
         st.rerun()
