@@ -6,17 +6,17 @@ import io
 import os
 from fpdf import FPDF
 
-st.set_page_config(page_title="MGVCL Estimate Tool", layout="wide")
+st.set_page_config(page_title="MGVCL Estimate System", layout="wide")
 
 MASTER_DATA_FILE = "master_rates_db.csv"
 
-# --- REFINED PDF CLASS ---
+# --- PDF DESIGN (A4) ---
 class MGVCL_Official_PDF(FPDF):
     def header(self):
         self.set_font('Arial', 'B', 14)
         self.cell(0, 8, 'MADHYA GUJARAT VIJ COMPANY LIMITED', 0, 1, 'C')
         self.set_font('Arial', 'B', 11)
-        self.cell(0, 6, 'Detailed Work Expenditure Estimate', 0, 1, 'C')
+        self.cell(0, 6, 'Work Expenditure Estimate (2024-25)', 0, 1, 'C')
         self.ln(5)
         self.line(10, 28, 200, 28)
 
@@ -58,120 +58,123 @@ if os.path.exists(MASTER_DATA_FILE):
 else:
     master_df = pd.DataFrame()
 
-# --- SIDEBAR ---
+# --- SIDEBAR DATABASE ---
 with st.sidebar:
-    st.header("Database Update")
-    new_pdfs = st.file_uploader("Upload Cost Data PDFs", type="pdf", accept_multiple_files=True)
-    if st.button("Sync Data"):
+    st.header("Admin Settings")
+    new_pdfs = st.file_uploader("Sync New Cost Data PDFs", type="pdf", accept_multiple_files=True)
+    if st.button("Update Database"):
         if new_pdfs:
             master_df = process_pdfs(new_pdfs)
             master_df.to_csv(MASTER_DATA_FILE, index=False)
-            st.success("Synced!")
+            st.success("Database Updated!")
             st.rerun()
 
-# --- MAIN INTERFACE ---
-st.title("⚡ MGVCL Estimate System")
+# --- PROJECT HEADER ---
+st.title("⚡ MGVCL Smart Estimator")
 
-if master_df.empty:
-    st.warning("Please upload PDFs in the sidebar once to initialize.")
-    st.stop()
-
-# Project Info
-with st.expander("📝 Project Details", expanded=True):
-    c1, c2, c3 = st.columns(3)
-    scheme = c1.text_input("Name of Scheme")
+with st.expander("📝 Step 1: Project Details", expanded=True):
+    c1, c2 = st.columns(2)
+    scheme = c1.text_input("Name of Scheme (RDSS / RE / etc.)")
     sub_div = c2.text_input("Sub Division", value="Karachiya/Savli")
-    location = c3.text_input("Location/Village")
+    
+    c3, c4 = st.columns(2)
+    location = c3.text_input("Location / Village")
+    work_title = c4.text_input("Work Name")
 
 if 'basket' not in st.session_state:
     st.session_state.basket = []
 
-# --- MULTI-WORD SMART SEARCH ---
-st.subheader("🔍 Instant Item Search")
-search_input = st.text_input("Search keywords (e.g., '11KV AAAC' or '3PH 5HP')")
+# --- STEP 2: SEARCH & ADD ---
+st.subheader("🔍 Step 2: Search & Add Materials")
+search_input = st.text_input("Type words to filter (e.g. '11KV AAAC' or '3PH CONNECTION')")
 
 if search_input:
-    # Break input into separate words
+    # Logic: Match all words in any order
     keywords = search_input.lower().split()
-    # Find items that contain EVERY word in the search input
     mask = master_df['Particulars'].apply(lambda x: all(k in str(x).lower() for k in keywords))
     results = master_df[mask]
     
     if not results.empty:
-        selection = st.selectbox(f"Found {len(results)} items:", results['Particulars'].unique())
-        item = master_df[master_df['Particulars'] == selection].iloc[0]
+        # Show results in a clean table or selection box
+        selected_desc = st.selectbox(f"Matches Found ({len(results)}):", results['Particulars'].unique())
+        item = master_df[master_df['Particulars'] == selected_desc].iloc[0]
         
-        col_q, col_b = st.columns([1, 1])
-        qty = col_q.number_input(f"Qty for {item['Unit']}", min_value=0.0, step=0.01)
-        
-        if col_b.button("➕ Add Item", use_container_width=True):
-            st.session_state.basket.append({
-                "Code": str(item['Group_Code']),
-                "Description": item['Particulars'],
-                "Unit": item['Unit'],
-                "Rate": item['Rate'],
-                "Qty": qty,
-                "Total": qty * item['Rate']
-            })
-            st.rerun()
+        # Immediate Quantity Request
+        with st.form("add_form", clear_on_submit=True):
+            col_info, col_qty, col_btn = st.columns([2,1,1])
+            col_info.info(f"**Code:** {item['Group_Code']} | **Rate:** {item['Rate']:,.2f}")
+            qty = col_qty.number_input(f"Enter Quantity ({item['Unit']})", min_value=0.0, step=0.01)
+            if col_btn.form_submit_button("Add to Estimate"):
+                st.session_state.basket.append({
+                    "Code": str(item['Group_Code']),
+                    "Description": item['Particulars'],
+                    "Unit": item['Unit'],
+                    "Rate": item['Rate'],
+                    "Qty": qty,
+                    "Total": qty * item['Rate']
+                })
+                st.success(f"Added {qty} {item['Unit']}")
+                st.rerun()
     else:
-        st.error("No items match those keywords.")
+        st.error("No items found matching those keywords.")
 
-# --- ESTIMATE & PRINT ---
+# --- STEP 3: PREVIEW & PRINT ---
 if st.session_state.basket:
     st.divider()
+    st.subheader("📋 Step 3: Preview & Print")
     est_df = pd.DataFrame(st.session_state.basket)
-    st.table(est_df.style.format({"Rate": "{:,.2f}", "Total": "{:,.2f}"}))
+    st.dataframe(est_df[["Code", "Description", "Unit", "Qty", "Total"]], use_container_width=True)
     
     total_amt = est_df['Total'].sum()
-    st.subheader(f"Grand Total: Rs. {total_amt:,.2f}")
+    st.subheader(f"Total Estimate: ₹ {total_amt:,.2f}")
 
-    # PDF Logic with "Direct Print" feel
-    def create_direct_print_pdf(df, sch, sdiv, loc, grand_total):
+    # Generate PDF Function
+    def generate_pdf(df, sch, sdiv, loc, g_total):
         pdf = MGVCL_Official_PDF()
         pdf.add_page()
         
-        # Header Box
+        # Project Info Box
         pdf.set_font('Arial', 'B', 10)
-        pdf.cell(0, 8, f" Scheme: {sch.upper()}", 1, 1)
-        pdf.cell(95, 8, f" Sub Division: {sdiv}", 1, 0)
-        pdf.cell(95, 8, f" Location: {loc}", 1, 1)
-        pdf.ln(5)
+        pdf.cell(0, 8, f" SCHEME: {sch.upper()}", 1, 1)
+        pdf.cell(95, 8, f" SUB DIVISION: {sdiv.upper()}", 1, 0)
+        pdf.cell(95, 8, f" LOCATION: {loc.upper()}", 1, 1)
+        pdf.ln(4)
 
-        # Headers - Fixed widths to prevent overlap
-        pdf.set_fill_color(230, 230, 230)
+        # Headers
+        pdf.set_fill_color(240, 240, 240)
         pdf.cell(25, 10, "Group Code", 1, 0, 'C', True)
-        pdf.cell(90, 10, "Particulars / Description", 1, 0, 'C', True)
+        pdf.cell(95, 10, "Particulars / Description", 1, 0, 'C', True)
         pdf.cell(15, 10, "Unit", 1, 0, 'C', True)
-        pdf.cell(20, 10, "Qty", 1, 0, 'C', True)
+        pdf.cell(15, 10, "Qty", 1, 0, 'C', True)
         pdf.cell(40, 10, "Amount (Rs.)", 1, 1, 'C', True)
         
         pdf.set_font('Arial', '', 9)
         for _, row in df.iterrows():
-            # Calculate height for description to prevent overlap
             desc = str(row['Description'])
-            num_lines = (len(desc) // 50) + 1 # Rough estimate for height
-            h = num_lines * 6 if num_lines > 1 else 10
+            # Dynamic height calculation to prevent column overlap
+            # 55 characters width for description box
+            h = (len(desc) // 55 + 1) * 6
+            if h < 10: h = 10
             
-            y_curr = pdf.get_y()
-            pdf.multi_cell(90, 6 if num_lines > 1 else 10, desc, 1) # Description
-            y_end = pdf.get_y()
-            row_h = y_end - y_curr
+            curr_y = pdf.get_y()
+            pdf.multi_cell(95, 6 if h > 10 else 10, desc, 1)
+            end_y = pdf.get_y()
+            row_h = end_y - curr_y
             
-            pdf.set_y(y_curr)
-            pdf.cell(25, row_h, str(row['Code']), 1, 0, 'C') # Code
-            pdf.set_x(125) # Skip Particulars
-            pdf.cell(15, row_h, str(row['Unit']), 1, 0, 'C') # Unit
-            pdf.cell(20, row_h, str(row['Qty']), 1, 0, 'C') # Qty
-            pdf.cell(40, row_h, f"{row['Total']:,.2f}", 1, 1, 'R') # Total
+            pdf.set_y(curr_y)
+            pdf.cell(25, row_h, str(row['Code']), 1, 0, 'C')
+            pdf.set_x(130) # Skip Multi-cell area
+            pdf.cell(15, row_h, str(row['Unit']), 1, 0, 'C')
+            pdf.cell(15, row_h, str(row['Qty']), 1, 0, 'C')
+            pdf.cell(40, row_h, f"{row['Total']:,.2f}", 1, 1, 'R')
 
-        # Total Row
+        # Summary
         pdf.set_font('Arial', 'B', 11)
-        pdf.cell(150, 12, "TOTAL EXPENDITURE ", 1, 0, 'R')
-        pdf.cell(40, 12, f"{grand_total:,.2f}", 1, 1, 'R')
+        pdf.cell(150, 12, "GRAND TOTAL ESTIMATE (Rs.) ", 1, 0, 'R')
+        pdf.cell(40, 12, f"{g_total:,.2f}", 1, 1, 'R')
         
-        # Official Signatures
-        pdf.ln(25)
+        # Official Authorities
+        pdf.ln(20)
         pdf.set_font('Arial', 'B', 10)
         pdf.cell(95, 10, "Prepared by: Junior Engineer", 0, 0, 'L')
         pdf.cell(95, 10, "Approved by: Deputy Engineer", 0, 1, 'R')
@@ -179,16 +182,16 @@ if st.session_state.basket:
         return pdf.output()
 
     c1, c2 = st.columns(2)
-    # Combined step: Clicking this provides the PDF immediately
-    pdf_output = create_direct_print_pdf(est_df, scheme, sub_div, location, total_amt)
+    # Direct Download
+    pdf_out = generate_pdf(est_df, scheme, sub_div, location, total_amt)
     c1.download_button(
         label="🖨️ Direct Print Estimate (PDF)",
-        data=bytes(pdf_output),
-        file_name=f"Estimate_{location}.pdf",
+        data=bytes(pdf_out),
+        file_name=f"MGVCL_Estimate_{location}.pdf",
         mime="application/pdf",
         use_container_width=True
     )
     
-    if c2.button("🗑️ Clear & Start New", use_container_width=True):
+    if c2.button("🗑️ Reset Everything", use_container_width=True):
         st.session_state.basket = []
         st.rerun()
