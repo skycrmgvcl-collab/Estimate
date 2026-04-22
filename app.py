@@ -7,15 +7,20 @@ import io
 try:
     import pdfplumber
 except ImportError:
-    st.error("The library 'pdfplumber' is not installed. Ensure your 'requirements.txt' is correct.")
+    st.error("The library 'pdfplumber' is not installed. Check your requirements.txt.")
     st.stop()
 
 st.set_page_config(page_title="DISCOM Estimator", layout="wide")
 
-def clean_rate(rate_str):
-    if not rate_str: return 0.0
-    cleaned = re.sub(r'[^\d.]', '', str(rate_str))
-    return float(cleaned) if cleaned else 0.0
+def clean_rate(val):
+    """Extracts only numbers from a string, handling newlines and commas."""
+    if not val: return 0.0
+    # Removes all non-numeric characters except the decimal point
+    cleaned = re.sub(r'[^\d.]', '', str(val))
+    try:
+        return float(cleaned)
+    except ValueError:
+        return 0.0
 
 def process_pdfs(files):
     all_rows = []
@@ -23,71 +28,87 @@ def process_pdfs(files):
         with pdfplumber.open(io.BytesIO(uploaded_file.read())) as pdf:
             for page in pdf.pages:
                 table = page.extract_table()
-                if not table: continue
+                if not table or len(table) < 2:
+                    continue
                 
-                # Get the header row and clean it
-                headers = [str(h).strip().upper().replace('\n', ' ') for h in table[0]]
-                df_temp = pd.DataFrame(table[1:], columns=headers)
-                
-                # Dynamically find column names even if they change slightly
-                col_map = {
-                    'CODE': next((c for c in headers if 'GROUP' in c or 'CODE' in c), None),
-                    'DESC': next((c for c in headers if 'PARTICULARS' in c or 'DESCRIPTION' in c), None),
-                    'UNIT': next((c for c in headers if 'UNIT' in c), None),
-                    'RATE': next((c for c in headers if 'RATE' in c), None)
-                }
+                for row in table:
+                    # Clean all cells in the row: remove newlines and extra spaces
+                    clean_row = [str(cell).replace('\n', ' ').strip() if cell else "" for cell in row]
+                    
+                    # Logic to identify the right row:
+                    # 1. Group Code usually starts with '9601' or is a 10-digit number
+                    # 2. Rate is usually a large number in one of the last columns
+                    
+                    group_code = ""
+                    particulars = ""
+                    unit = ""
+                    rate = 0.0
+                    
+                    # Search for Group Code (usually the first long number found)
+                    for cell in clean_row:
+                        if re.match(r'^\d{8,12}$', cell.replace(" ", "")):
+                            group_code = cell
+                            break
+                    
+                    if not group_code:
+                        continue # Skip rows that don't have a valid Group Code
+                    
+                    # Based on your specific PDF structure:
+                    # Index 0: Group Code, Index 2: Particulars, Index 3: Unit, Index 4: Rate
+                    try:
+                        particulars = clean_row[2]
+                        unit = clean_row[3]
+                        rate = clean_rate(clean_row[4])
+                    except IndexError:
+                        continue
 
-                for _, row in df_temp.iterrows():
-                    p_val = row.get(col_map['DESC'], '')
-                    r_val = row.get(col_map['RATE'], 0)
-                    
-                    particulars = str(p_val).replace('\n', ' ').strip() if p_val else ""
-                    rate = clean_rate(r_val)
-                    
                     if particulars and rate > 0:
                         all_rows.append({
-                            "Group_Code": str(row.get(col_map['CODE'], '')).strip().replace('\n', ''),
+                            "Group_Code": group_code,
                             "Particulars": particulars,
-                            "Unit": str(row.get(col_map['UNIT'], '')).strip(),
+                            "Unit": unit,
                             "Rate": rate
                         })
+    
     return pd.DataFrame(all_rows)
 
 st.title("⚡ DISCOM Work Expenditure Estimator")
 
-# Sidebar Upload
-st.sidebar.header("Upload Data")
+# --- SIDEBAR ---
+st.sidebar.header("Data Sources")
 uploaded_pdfs = st.sidebar.file_uploader("Upload Cost Data PDFs", type="pdf", accept_multiple_files=True)
 
 if not uploaded_pdfs:
-    st.info("👈 Please upload your Cost Data PDFs in the sidebar to begin.")
+    st.info("👈 Please upload your Cost Data PDFs in the sidebar.")
     st.stop()
 
-# Load data
+# --- DATA PROCESSING ---
 master_df = process_pdfs(uploaded_pdfs)
 
 if master_df.empty:
-    st.warning("No valid data found in the uploaded PDFs. Check the column headers.")
+    st.error("Still unable to find data. Please ensure the PDF contains the 'Group Code' and 'Rate' table.")
+    # Debug: show what the script sees
+    with st.expander("Debug: See Raw PDF Content"):
+        with pdfplumber.open(io.BytesIO(uploaded_pdfs[0].read())) as pdf:
+            st.write(pdf.pages[0].extract_table())
     st.stop()
 
+# --- ESTIMATE LOGIC ---
 if 'basket' not in st.session_state:
     st.session_state.basket = []
 
-# --- Search and Select ---
 st.subheader("Add Items to Estimate")
-search = st.text_input("Search by Name (e.g., 'Transformer', '11 KV')")
-
-# The fix: Case-insensitive search on the 'Particulars' column we created
+search = st.text_input("Search (e.g., 'Transformer', '11 KV', 'Connection')")
 filtered = master_df[master_df['Particulars'].str.contains(search, case=False, na=False)]
 
 if not filtered.empty:
-    selection = st.selectbox("Select Item", filtered['Particulars'].unique())
+    selection = st.selectbox("Select exact item:", filtered['Particulars'].unique())
     item = master_df[master_df['Particulars'] == selection].iloc[0]
     
-    c1, c2 = st.columns([2, 1])
-    qty = c1.number_input(f"Quantity ({item['Unit']})", min_value=0.0, step=0.01)
+    col1, col2 = st.columns([2, 1])
+    qty = col1.number_input(f"Quantity for {item['Unit']}", min_value=0.0, step=0.01)
     
-    if c2.button("➕ Add to Estimate", use_container_width=True):
+    if col2.button("➕ Add to Estimate", use_container_width=True):
         st.session_state.basket.append({
             "Code": item['Group_Code'],
             "Particulars": item['Particulars'],
@@ -98,13 +119,12 @@ if not filtered.empty:
         })
         st.rerun()
 
-# --- Results ---
+# --- DISPLAY TABLE ---
 if st.session_state.basket:
     st.divider()
-    est_df = pd.DataFrame(st.session_state.basket)
-    st.table(est_df.style.format({"Rate": "{:,.2f}", "Total": "{:,.2f}"}))
-    
-    st.metric("Grand Total Expenditure", f"Rs. {est_df['Total'].sum():,.2f}")
+    res_df = pd.DataFrame(st.session_state.basket)
+    st.table(res_df.style.format({"Rate": "{:,.2f}", "Total": "{:,.2f}"}))
+    st.metric("Total Estimate", f"Rs. {res_df['Total'].sum():,.2f}")
     
     if st.button("🗑️ Clear All"):
         st.session_state.basket = []
